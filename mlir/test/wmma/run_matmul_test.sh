@@ -41,9 +41,10 @@ fi
 # Calculate flops.
 ((flops = $problem_size_m * $problem_size_n * $problem_size_k * 2))
 
-MLIR_OPT="../../../build/bin/mlir-opt"
-MLIR_CPU_RUNNER="../../../build/bin/mlir-cpu-runner"
-MLIR_RUNTIME_LIB_DIR="../../../build/lib"
+MLIR_REPO_BASE="/data/apps/compilers/llvm-project-mcl-csa"
+MLIR_OPT="mlir-opt"
+MLIR_CPU_RUNNER="mlir-cpu-runner"
+MLIR_RUNTIME_LIB_DIR="/data/apps/compilers/llvm/15.0.x-mcl-csa/lib"
 MLIR_RUNTIME_LIBS="--shared-libs=$MLIR_RUNTIME_LIB_DIR/libmlir_runner_utils.so --shared-libs=$MLIR_RUNTIME_LIB_DIR/libmlir_cuda_runtime.so --shared-libs=$MLIR_RUNTIME_LIB_DIR/libmlir_c_runner_utils.so"
 
 # Run the optimized version with the full pipeline.
@@ -51,9 +52,9 @@ echo "Generating and running matmul (optimized)"
 
 if [[ "$accum" == "f32" ]]
 then
-  ./gen_matmul_full_pipe.sh $problem_size_m $problem_size_k $problem_size_n $print_output > matmul_opt_base.mlir
+  ${MLIR_REPO_BASE}/mlir/test/wmma/gen_matmul_full_pipe.sh $problem_size_m $problem_size_k $problem_size_n $print_output > matmul_opt_base.mlir
 else
-  ./gen_matmul_full_pipe_f16.sh $problem_size_m $problem_size_k $problem_size_n $print_output > matmul_opt_base.mlir
+  ${MLIR_REPO_BASE}/mlir/test/wmma/gen_matmul_full_pipe_f16.sh $problem_size_m $problem_size_k $problem_size_n $print_output > matmul_opt_base.mlir
 fi
 
 $MLIR_OPT matmul_opt_base.mlir \
@@ -86,7 +87,7 @@ $MLIR_OPT matmul_opt_base.mlir \
 $MLIR_OPT matmul_opt_final.mlir -pass-pipeline='gpu.module(strip-debuginfo,convert-gpu-to-nvvm{index-bitwidth=32},gpu-to-cubin{chip=sm_75 max-reg-per-thread='$reg_per_thread' cu-jit-opt-level='$jit_opt_level'})' -gpu-to-llvm | nsys profile --force-overwrite true -o gpu_ $MLIR_CPU_RUNNER -O3 $MLIR_RUNTIME_LIBS --entry-point-result=void > full_pipe.out 2> dump_.txt
 
 # Get average execution time of `main_kernel`.
-interval=$(nsys stats -q --force-overwrite true --format csv --report gpukernsum gpu_.qdrep | (awk '/main_kernel/') | (awk -F',' '{print $4}'))
+interval=$(nsys stats -q --force-overwrite true --format csv --report gpukernsum gpu_.nsys-rep | (awk '/main_kernel/') | (awk -F',' '{print $4}'))
 
 rm -f gpu_.dqrep
 rm -f gpu_.sqlite
@@ -100,16 +101,19 @@ then
 fi
 
 # Calculate performance.
->&2 printf '%.6f TFLOPs\n' $(echo "(($flops / $interval) * 1000000000) / 1000000000000" | bc -l)
+>&2 printf '%.6f GFLOPs\n' $(echo "(($flops / $interval) * 1000000000) / 1000000000" | bc -l)
 
 # Delete first line in the output which is irrelevant for output verification.
 sed '1d' full_pipe.out > tmpfile; mv tmpfile full_pipe.out
+
+# Remove nsys output
+sed -i '/Gene.*/,+10d' full_pipe.out
 
 # Run the naive version for verification.
 if [[ $verify -eq 1 ]]
 then
   echo "Generating and running matmul naive (unoptimized)"
-  ./gen_matmul_naive.sh $problem_size_m $problem_size_k $problem_size_n > matmul_naive.mlir
+  ${MLIR_REPO_BASE}/mlir/test/wmma/gen_matmul_naive.sh $problem_size_m $problem_size_k $problem_size_n > matmul_naive.mlir
   $MLIR_OPT matmul_naive.mlir --convert-scf-to-std | $MLIR_OPT -pass-pipeline='gpu.module(strip-debuginfo,convert-gpu-to-nvvm{index-bitwidth=32},gpu-to-cubin{chip=sm_75 max-reg-per-thread=255 cu-jit-opt-level=4})' -gpu-to-llvm | $MLIR_CPU_RUNNER -O3 $MLIR_RUNTIME_LIBS --entry-point-result=void > naive.out
 
   echo -ne "Verifying...   "
